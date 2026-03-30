@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: luadec-server
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    healthCheckPath: /health
+    envVars:
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: SERVER_UPLOAD_API_KEY
+        sync: false
+      - key: SERVER_SECRET
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_COLLECTION
+        value: scripts
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+
