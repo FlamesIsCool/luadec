@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import hashlib
 import hmac
+import secrets
+import threading
 import time
+from urllib import request as urllib_request
 from collections import defaultdict, deque
 from functools import wraps
 
@@ -63,6 +67,7 @@ def rate_limited(bucket_name: str):
         @wraps(func)
         def wrapper(*args, **kwargs):
             if not apply_rate_limit(bucket_name):
+                send_security_alert("rate_limit_exceeded", kwargs.get("script_id"), {"bucket": bucket_name})
                 return jsonify({"error": "Rate limit exceeded"}), 429
             return func(*args, **kwargs)
 
@@ -103,6 +108,63 @@ def roblox_only(req) -> bool:
 def sign_raw_request(script_id: str, ts: str) -> str:
     message = f"{script_id}{ts}".encode("utf-8")
     return hmac.new(server_secret_bytes(), message, hashlib.sha256).hexdigest()
+
+
+def sign_loader_ticket(script_id: str, ts: str, nonce: str, client_ip: str) -> str:
+    message = f"{script_id}:{ts}:{nonce}:{client_ip}".encode("utf-8")
+    return hmac.new(server_secret_bytes(), message, hashlib.sha256).hexdigest()
+
+
+def post_webhook(payload: dict[str, object]) -> None:
+    if not server_settings.alert_webhook_url:
+        return
+
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib_request.Request(
+        server_settings.alert_webhook_url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=5):
+            pass
+    except Exception:
+        pass
+
+
+def send_security_alert(reason: str, script_id: str | None, extra: dict[str, object] | None = None) -> None:
+    if not server_settings.alert_webhook_url:
+        return
+
+    client_ip = get_client_ip()
+    payload = {
+        "embeds": [
+            {
+                "title": "Source access alert",
+                "color": 0xFFFFFF,
+                "fields": [
+                    {"name": "Reason", "value": reason, "inline": True},
+                    {"name": "Script ID", "value": script_id or "unknown", "inline": True},
+                    {"name": "IP", "value": client_ip, "inline": True},
+                    {"name": "Method", "value": request.method, "inline": True},
+                    {"name": "Path", "value": request.path, "inline": True},
+                    {"name": "User-Agent", "value": (request.headers.get("User-Agent") or "unknown")[:1024], "inline": False},
+                ],
+            }
+        ]
+    }
+
+    if extra:
+        compact = json.dumps(extra, ensure_ascii=True)[:1000]
+        payload["embeds"][0]["fields"].append({"name": "Details", "value": compact or "{}", "inline": False})
+
+    threading.Thread(target=post_webhook, args=(payload,), daemon=True).start()
+
+
+def deny_access(message: str, status_code: int, reason: str, script_id: str | None, extra: dict[str, object] | None = None) -> Response:
+    send_security_alert(reason, script_id, extra)
+    return Response(message, status=status_code)
 
 
 def no_store_headers(response: Response) -> Response:
@@ -164,6 +226,9 @@ def loader(script_id: str) -> Response:
     if not record:
         return Response("Not found", status=404)
 
+    ts = str(int(time.time()))
+    nonce = secrets.token_urlsafe(8)
+    ticket = sign_loader_ticket(script_id, ts, nonce, get_client_ip())
     loader_source = (
         shared_key_reader_lua()
         + f"""
@@ -173,7 +238,7 @@ if type(key) ~= "string" or key == "" then
 end
 
 local HttpService = game:GetService("HttpService")
-local signedUrl = "{server_settings.public_base_url}/signed/{script_id}?key=" .. HttpService:UrlEncode(key)
+local signedUrl = "{server_settings.public_base_url}/signed/{script_id}?ts={ts}&nonce={nonce}&ticket={ticket}&key=" .. HttpService:UrlEncode(key)
 loadstring(game:HttpGet(signedUrl))()
 """
     )
@@ -189,17 +254,41 @@ def signed(script_id: str) -> Response:
 
     provided_key = request.args.get("key", "")
     if not provided_key:
-        return Response("Missing script key", status=403)
+        return deny_access("Missing script key", 403, "missing_script_key", script_id)
+
+    ts = request.args.get("ts", "")
+    nonce = request.args.get("nonce", "")
+    ticket = request.args.get("ticket", "")
+    if not ts or not nonce or not ticket:
+        return deny_access(
+            "Access denied",
+            403,
+            "missing_loader_ticket",
+            script_id,
+            {"has_ts": bool(ts), "has_nonce": bool(nonce), "has_ticket": bool(ticket)},
+        )
+
+    try:
+        ts_int = int(ts)
+    except ValueError:
+        return deny_access("Access denied", 403, "bad_loader_timestamp", script_id)
+
+    if abs(time.time() - ts_int) > server_settings.signed_url_ttl_seconds:
+        return deny_access("Access denied", 403, "expired_loader_ticket", script_id)
+
+    expected_ticket = sign_loader_ticket(script_id, ts, nonce, get_client_ip())
+    if not hmac.compare_digest(expected_ticket, ticket):
+        return deny_access("Access denied", 403, "invalid_loader_ticket", script_id)
 
     expected_hash = store.hash_key(provided_key, record.key_salt)
     if not hmac.compare_digest(expected_hash, record.key_hash):
-        return Response("Invalid script key", status=403)
+        return deny_access("Invalid script key", 403, "invalid_script_key", script_id)
 
-    ts = str(int(time.time()))
-    sig = sign_raw_request(script_id, ts)
+    raw_ts = str(int(time.time()))
+    sig = sign_raw_request(script_id, raw_ts)
     raw_url = (
         f"{server_settings.public_base_url}/raw/{script_id}"
-        f"?token={record.token}&ts={ts}&sig={sig}"
+        f"?token={record.token}&ts={raw_ts}&sig={sig}"
     )
 
     return Response(f'loadstring(game:HttpGet("{raw_url}"))()', mimetype="text/plain")
@@ -217,25 +306,31 @@ def raw(script_id: str) -> Response:
     sig = request.args.get("sig", "")
 
     if not token or not ts or not sig:
-        return Response("Missing fields", status=403)
+        return deny_access("Missing fields", 403, "missing_raw_fields", script_id)
 
     if not hmac.compare_digest(token, record.token):
-        return Response("Invalid token", status=403)
+        return deny_access("Invalid token", 403, "invalid_raw_token", script_id)
 
     try:
         ts_int = int(ts)
     except ValueError:
-        return Response("Bad timestamp", status=403)
+        return deny_access("Bad timestamp", 403, "bad_raw_timestamp", script_id)
 
     if abs(time.time() - ts_int) > server_settings.signed_url_ttl_seconds:
-        return Response("Expired request", status=403)
+        return deny_access("Expired request", 403, "expired_raw_request", script_id)
 
     expected = sign_raw_request(script_id, ts)
     if not hmac.compare_digest(expected, sig):
-        return Response("Invalid signature", status=403)
+        return deny_access("Invalid signature", 403, "invalid_raw_signature", script_id)
 
     if not roblox_only(request):
-        return Response("Access denied", status=403)
+        return deny_access(
+            "Access denied",
+            403,
+            "blocked_non_roblox_fetch",
+            script_id,
+            {"referer": request.headers.get("Referer", "")[:300]},
+        )
 
     return Response(record.raw_script, mimetype="text/plain")
 

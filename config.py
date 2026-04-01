@@ -39,6 +39,7 @@ class ServerSettings:
     public_base_url: str
     upload_api_key: str
     secret: str
+    alert_webhook_url: str | None
     port: int
     signed_url_ttl_seconds: int
     rate_limit_window_seconds: int
@@ -77,6 +78,7 @@ def load_server_settings() -> ServerSettings:
         public_base_url=require_env("PUBLIC_BASE_URL").rstrip("/"),
         upload_api_key=require_env("SERVER_UPLOAD_API_KEY"),
         secret=require_env("SERVER_SECRET"),
+        alert_webhook_url=os.environ.get("DISCORD_ALERT_WEBHOOK_URL", "").strip() or None,
         port=int(os.environ.get("PORT", "5000")),
         signed_url_ttl_seconds=int(os.environ.get("SIGNED_URL_TTL_SECONDS", "15")),
         rate_limit_window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
