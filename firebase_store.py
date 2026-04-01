@@ -10,6 +10,7 @@ from typing import Any
 
 import firebase_admin
 from firebase_admin import credentials, firestore
+from cryptography.fernet import Fernet, InvalidToken
 
 from config import FirebaseSettings
 from loader_builder import build_final_snippet
@@ -33,10 +34,11 @@ class UploadBundle:
 
 
 class FirebaseScriptStore:
-    def __init__(self, settings: FirebaseSettings) -> None:
+    def __init__(self, settings: FirebaseSettings, encryption_secret: str) -> None:
         self._settings = settings
         self._app = self._init_app(settings)
         self._db = firestore.client(app=self._app)
+        self._cipher = Fernet(self._derive_cipher_key(encryption_secret))
 
     @staticmethod
     def _init_app(settings: FirebaseSettings) -> firebase_admin.App:
@@ -71,6 +73,22 @@ class FirebaseScriptStore:
         salt = base64.urlsafe_b64encode(os.urandom(16)).decode("ascii")
         return FirebaseScriptStore.hash_key(script_key, salt), salt
 
+    @staticmethod
+    def _derive_cipher_key(secret: str) -> bytes:
+        digest = hashlib.sha256(secret.encode("utf-8")).digest()
+        return base64.urlsafe_b64encode(digest)
+
+    def encrypt_script(self, script_source: str) -> str:
+        encrypted = self._cipher.encrypt(script_source.encode("utf-8"))
+        return encrypted.decode("ascii")
+
+    def decrypt_script(self, encrypted_script: str) -> str:
+        try:
+            plaintext = self._cipher.decrypt(encrypted_script.encode("ascii"))
+        except InvalidToken as exc:
+            raise RuntimeError("Stored script could not be decrypted.") from exc
+        return plaintext.decode("utf-8")
+
     def create_script(
         self,
         *,
@@ -94,7 +112,7 @@ class FirebaseScriptStore:
                 "owner_id": str(owner_id),
                 "owner_name": owner_name,
                 "created_at": created_at,
-                "raw_script": script_source,
+                "encrypted_script": self.encrypt_script(script_source),
                 "token": token,
                 "key_hash": key_hash,
                 "key_salt": key_salt,
@@ -123,10 +141,25 @@ class FirebaseScriptStore:
             token = secrets.token_urlsafe(12)
             document.update({"token": token})
 
+        encrypted_script = str(data.get("encrypted_script", ""))
+        raw_script = str(data.get("raw_script", ""))
+        if encrypted_script:
+            resolved_script = self.decrypt_script(encrypted_script)
+        elif raw_script:
+            resolved_script = raw_script
+            document.update(
+                {
+                    "encrypted_script": self.encrypt_script(raw_script),
+                    "raw_script": firestore.DELETE_FIELD,
+                }
+            )
+        else:
+            resolved_script = ""
+
         return ScriptRecord(
             script_id=script_id,
             script_name=str(data.get("script_name", "")),
-            raw_script=str(data.get("raw_script", "")),
+            raw_script=resolved_script,
             token=token,
             key_hash=str(data.get("key_hash", "")),
             key_salt=str(data.get("key_salt", "")),

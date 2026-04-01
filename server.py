@@ -9,6 +9,7 @@ import time
 from urllib import request as urllib_request
 from collections import defaultdict, deque
 from functools import wraps
+from threading import Lock
 
 from flask import Flask, Response, jsonify, request
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -23,9 +24,14 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)  # type: ignore[assig
 
 firebase_settings = load_firebase_settings()
 server_settings = load_server_settings()
-store = FirebaseScriptStore(firebase_settings)
+store = FirebaseScriptStore(firebase_settings, server_settings.secret)
 
 request_buckets: dict[str, deque[float]] = defaultdict(deque)
+security_buckets: dict[str, deque[float]] = defaultdict(deque)
+blocked_clients: dict[str, float] = {}
+used_loader_tickets: dict[str, float] = {}
+used_raw_signatures: dict[str, float] = {}
+state_lock = Lock()
 
 RATE_LIMITS = {
     "upload": (45, server_settings.rate_limit_window_seconds),
@@ -33,6 +39,9 @@ RATE_LIMITS = {
     "signed": (180, server_settings.rate_limit_window_seconds),
     "raw": (180, server_settings.rate_limit_window_seconds),
 }
+SUSPICIOUS_ATTEMPT_LIMIT = 6
+SUSPICIOUS_WINDOW_SECONDS = 180
+BLOCK_DURATION_SECONDS = 900
 
 
 def server_secret_bytes() -> bytes:
@@ -62,10 +71,52 @@ def apply_rate_limit(bucket_name: str) -> bool:
     return True
 
 
+def cleanup_expired_entries(store_map: dict[str, float], now: float) -> None:
+    expired_keys = [key for key, expires_at in store_map.items() if expires_at <= now]
+    for key in expired_keys:
+        store_map.pop(key, None)
+
+
+def is_temporarily_blocked() -> bool:
+    now = time.time()
+    client_ip = get_client_ip()
+    with state_lock:
+        cleanup_expired_entries(blocked_clients, now)
+        expires_at = blocked_clients.get(client_ip)
+        return bool(expires_at and expires_at > now)
+
+
+def mark_suspicious_attempt() -> int:
+    now = time.time()
+    client_ip = get_client_ip()
+    with state_lock:
+        cleanup_expired_entries(blocked_clients, now)
+        bucket = security_buckets[client_ip]
+        while bucket and now - bucket[0] > SUSPICIOUS_WINDOW_SECONDS:
+            bucket.popleft()
+        bucket.append(now)
+        if len(bucket) >= SUSPICIOUS_ATTEMPT_LIMIT:
+            blocked_clients[client_ip] = now + BLOCK_DURATION_SECONDS
+        return len(bucket)
+
+
+def consume_once(store_map: dict[str, float], key: str, ttl_seconds: int) -> bool:
+    now = time.time()
+    with state_lock:
+        cleanup_expired_entries(store_map, now)
+        if key in store_map:
+            return False
+        store_map[key] = now + ttl_seconds
+        return True
+
+
 def rate_limited(bucket_name: str):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
+            if is_temporarily_blocked():
+                send_security_alert("blocked_ip", kwargs.get("script_id"), {"bucket": bucket_name})
+                return Response("Temporarily blocked", status=403)
             if not apply_rate_limit(bucket_name):
                 send_security_alert("rate_limit_exceeded", kwargs.get("script_id"), {"bucket": bucket_name})
                 return jsonify({"error": "Rate limit exceeded"}), 429
@@ -163,14 +214,31 @@ def send_security_alert(reason: str, script_id: str | None, extra: dict[str, obj
 
 
 def deny_access(message: str, status_code: int, reason: str, script_id: str | None, extra: dict[str, object] | None = None) -> Response:
-    send_security_alert(reason, script_id, extra)
+    attempts = mark_suspicious_attempt()
+    details = dict(extra or {})
+    details["attempts"] = attempts
+    details["blocked"] = is_temporarily_blocked()
+    send_security_alert(reason, script_id, details)
     return Response(message, status=status_code)
+
+
+def build_watermarked_script(script_id: str, script_source: str) -> str:
+    client_ip = get_client_ip()
+    stamp = str(int(time.time()))
+    marker = hmac.new(
+        server_secret_bytes(),
+        f"{script_id}:{client_ip}:{stamp}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:16]
+    return f"-- luadec delivery marker: {script_id}:{stamp}:{marker}\n{script_source}"
 
 
 def no_store_headers(response: Response) -> Response:
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
 
@@ -280,6 +348,9 @@ def signed(script_id: str) -> Response:
     if not hmac.compare_digest(expected_ticket, ticket):
         return deny_access("Access denied", 403, "invalid_loader_ticket", script_id)
 
+    if not consume_once(used_loader_tickets, f"{script_id}:{ticket}", server_settings.signed_url_ttl_seconds):
+        return deny_access("Access denied", 403, "replayed_loader_ticket", script_id)
+
     expected_hash = store.hash_key(provided_key, record.key_salt)
     if not hmac.compare_digest(expected_hash, record.key_hash):
         return deny_access("Invalid script key", 403, "invalid_script_key", script_id)
@@ -323,6 +394,9 @@ def raw(script_id: str) -> Response:
     if not hmac.compare_digest(expected, sig):
         return deny_access("Invalid signature", 403, "invalid_raw_signature", script_id)
 
+    if not consume_once(used_raw_signatures, f"{script_id}:{sig}", server_settings.signed_url_ttl_seconds):
+        return deny_access("Access denied", 403, "replayed_raw_signature", script_id)
+
     if not roblox_only(request):
         return deny_access(
             "Access denied",
@@ -332,7 +406,7 @@ def raw(script_id: str) -> Response:
             {"referer": request.headers.get("Referer", "")[:300]},
         )
 
-    return Response(record.raw_script, mimetype="text/plain")
+    return Response(build_watermarked_script(script_id, record.raw_script), mimetype="text/plain")
 
 
 if __name__ == "__main__":
