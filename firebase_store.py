@@ -20,6 +20,7 @@ class ScriptRecord:
     script_id: str
     script_name: str
     raw_script: str
+    token: str
     key_hash: str
     key_salt: str
     created_at: int
@@ -81,6 +82,7 @@ class FirebaseScriptStore:
         public_base_url: str,
     ) -> UploadBundle:
         script_id = secrets.token_hex(4)
+        token = secrets.token_urlsafe(12)
         created_at = int(time.time())
         key_hash, key_salt = self.create_key_hash(script_key)
 
@@ -93,6 +95,7 @@ class FirebaseScriptStore:
                 "owner_name": owner_name,
                 "created_at": created_at,
                 "raw_script": script_source,
+                "token": token,
                 "key_hash": key_hash,
                 "key_salt": key_salt,
             }
@@ -109,15 +112,22 @@ class FirebaseScriptStore:
         return UploadBundle(script_id=script_id, final_snippet=final_snippet)
 
     def get_script(self, script_id: str) -> ScriptRecord | None:
-        snapshot = self._db.collection(self._settings.collection).document(script_id).get()
+        document = self._db.collection(self._settings.collection).document(script_id)
+        snapshot = document.get()
         if not snapshot.exists:
             return None
 
         data: dict[str, Any] = snapshot.to_dict() or {}
+        token = str(data.get("token", ""))
+        if not token:
+            token = secrets.token_urlsafe(12)
+            document.update({"token": token})
+
         return ScriptRecord(
             script_id=script_id,
             script_name=str(data.get("script_name", "")),
             raw_script=str(data.get("raw_script", "")),
+            token=token,
             key_hash=str(data.get("key_hash", "")),
             key_salt=str(data.get("key_salt", "")),
             created_at=int(data.get("created_at", 0) or 0),

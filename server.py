@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import time
@@ -28,6 +27,7 @@ RATE_LIMITS = {
     "upload": (45, server_settings.rate_limit_window_seconds),
     "loader": (240, server_settings.rate_limit_window_seconds),
     "signed": (180, server_settings.rate_limit_window_seconds),
+    "raw": (180, server_settings.rate_limit_window_seconds),
 }
 
 
@@ -78,39 +78,9 @@ def require_upload_api_key() -> Response | None:
     return None
 
 
-def stream_seed(material: str) -> int:
-    seed = 2166136261
-    for index, char in enumerate(material.encode("utf-8"), start=1):
-        seed = (seed ^ (char + index)) & 0xFFFFFFFF
-        seed = (seed * 16777619) & 0xFFFFFFFF
-    return seed or 1
-
-
-def xor_stream_crypt(data: bytes, material: str) -> bytes:
-    state = stream_seed(material)
-    output = bytearray()
-    length = len(data)
-
-    for index, value in enumerate(data):
-        state ^= (state << 13) & 0xFFFFFFFF
-        state ^= (state >> 17) & 0xFFFFFFFF
-        state ^= (state << 5) & 0xFFFFFFFF
-        state &= 0xFFFFFFFF
-        mask = (state & 0xFF) ^ ((index * 31 + length) & 0xFF)
-        output.append(value ^ mask)
-
-    return bytes(output)
-
-
 def roblox_only(req) -> bool:
     ua = (req.headers.get("User-Agent") or "").lower()
-
     blocked = [
-        "mozilla",
-        "chrome",
-        "safari",
-        "edge",
-        "opera",
         "curl",
         "wget",
         "python",
@@ -122,19 +92,17 @@ def roblox_only(req) -> bool:
         "node",
         "httpx",
         "aiohttp",
-        "postman",
-        "insomnia",
     ]
 
-    if any(token in ua for token in blocked):
+    if any(item in ua for item in blocked):
         return False
 
-    if ua.startswith("roblox"):
-        return True
+    return ua.startswith("roblox")
 
-    # Some executors do not send a clean Roblox UA.
-    # If it is not obviously a browser/tool, allow it.
-    return ua != ""
+
+def sign_raw_request(script_id: str, ts: str) -> str:
+    message = f"{script_id}{ts}".encode("utf-8")
+    return hmac.new(server_secret_bytes(), message, hashlib.sha256).hexdigest()
 
 
 def no_store_headers(response: Response) -> Response:
@@ -142,117 +110,6 @@ def no_store_headers(response: Response) -> Response:
     response.headers["Pragma"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
-
-
-def build_encrypted_runtime(script_source: str, script_id: str, provided_key: str) -> str:
-    nonce = secrets.token_urlsafe(8)
-    material = f"{provided_key}:{script_id}:{nonce}"
-    payload = base64.b64encode(xor_stream_crypt(script_source.encode("utf-8"), material)).decode("ascii")
-
-    return f"""
-local function readScriptKey()
-    if type(script_key) == "string" and script_key ~= "" then
-        return script_key
-    end
-
-    local env = getgenv and getgenv() or nil
-    if env and type(env.script_key) == "string" and env.script_key ~= "" then
-        return env.script_key
-    end
-
-    if _G and type(_G.script_key) == "string" and _G.script_key ~= "" then
-        return _G.script_key
-    end
-
-    if shared and type(shared.script_key) == "string" and shared.script_key ~= "" then
-        return shared.script_key
-    end
-
-    return nil
-end
-
-local alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-
-local function base64Decode(data)
-    data = string.gsub(data, '[^' .. alphabet .. '=]', '')
-    return (data:gsub('.', function(char)
-        if char == '=' then
-            return ''
-        end
-
-        local value = string.find(alphabet, char, 1, true) - 1
-        local bits = ''
-        for bit = 6, 1, -1 do
-            bits = bits .. ((value % 2 ^ bit - value % 2 ^ (bit - 1) > 0) and '1' or '0')
-        end
-        return bits
-    end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(byte)
-        if #byte ~= 8 then
-            return ''
-        end
-
-        local value = 0
-        for i = 1, 8 do
-            if byte:sub(i, i) == '1' then
-                value = value + 2 ^ (8 - i)
-            end
-        end
-        return string.char(value)
-    end))
-end
-
-local function seedFromText(text)
-    local seed = 2166136261
-    for i = 1, #text do
-        seed = bit32.band(bit32.bxor(seed, string.byte(text, i) + i), 0xFFFFFFFF)
-        seed = bit32.band(seed * 16777619, 0xFFFFFFFF)
-    end
-    if seed == 0 then
-        seed = 1
-    end
-    return seed
-end
-
-local function nextMask(state, index, length)
-    state = bit32.band(bit32.bxor(state, bit32.lshift(state, 13)), 0xFFFFFFFF)
-    state = bit32.band(bit32.bxor(state, bit32.rshift(state, 17)), 0xFFFFFFFF)
-    state = bit32.band(bit32.bxor(state, bit32.lshift(state, 5)), 0xFFFFFFFF)
-    local mask = bit32.bxor(bit32.band(state, 0xFF), bit32.band(((index - 1) * 31 + length), 0xFF))
-    return state, mask
-end
-
-local function decryptPayload(payload, material)
-    local decoded = base64Decode(payload)
-    local length = #decoded
-    local state = seedFromText(material)
-    local parts = {{}}
-    local chunkIndex = 1
-
-    for i = 1, length do
-        local mask
-        state, mask = nextMask(state, i, length)
-        parts[chunkIndex][#parts[chunkIndex] + 1] = string.char(bit32.bxor(string.byte(decoded, i), mask))
-        if #parts[chunkIndex] >= 2048 then
-            chunkIndex = chunkIndex + 1
-            parts[chunkIndex] = {{}}
-        end
-    end
-
-    for i = 1, #parts do
-        parts[i] = table.concat(parts[i])
-    end
-
-    return table.concat(parts)
-end
-
-local key = readScriptKey()
-if type(key) ~= 'string' or key == '' then
-    error('Missing script_key')
-end
-
-local source = decryptPayload('{payload}', key .. ':{script_id}:{nonce}')
-loadstring(source)()
-""".strip()
 
 
 @app.after_request
@@ -297,12 +154,7 @@ def upload_script() -> Response:
         public_base_url=server_settings.public_base_url,
     )
 
-    return jsonify(
-        {
-            "script_id": bundle.script_id,
-            "loader": bundle.final_snippet,
-        }
-    )
+    return jsonify({"script_id": bundle.script_id, "loader": bundle.final_snippet})
 
 
 @app.get("/loader/<script_id>")
@@ -335,9 +187,6 @@ def signed(script_id: str) -> Response:
     if not record:
         return Response("Not found", status=404)
 
-    if not roblox_only(request):
-        return Response("Access denied", status=403)
-
     provided_key = request.args.get("key", "")
     if not provided_key:
         return Response("Missing script key", status=403)
@@ -346,8 +195,49 @@ def signed(script_id: str) -> Response:
     if not hmac.compare_digest(expected_hash, record.key_hash):
         return Response("Invalid script key", status=403)
 
-    runtime = build_encrypted_runtime(record.raw_script, script_id, provided_key)
-    return Response(runtime, mimetype="text/plain")
+    ts = str(int(time.time()))
+    sig = sign_raw_request(script_id, ts)
+    raw_url = (
+        f"{server_settings.public_base_url}/raw/{script_id}"
+        f"?token={record.token}&ts={ts}&sig={sig}"
+    )
+
+    return Response(f'loadstring(game:HttpGet("{raw_url}"))()', mimetype="text/plain")
+
+
+@app.get("/raw/<script_id>")
+@rate_limited("raw")
+def raw(script_id: str) -> Response:
+    record = store.get_script(script_id)
+    if not record:
+        return Response("Not found", status=404)
+
+    token = request.args.get("token", "")
+    ts = request.args.get("ts", "")
+    sig = request.args.get("sig", "")
+
+    if not token or not ts or not sig:
+        return Response("Missing fields", status=403)
+
+    if not hmac.compare_digest(token, record.token):
+        return Response("Invalid token", status=403)
+
+    try:
+        ts_int = int(ts)
+    except ValueError:
+        return Response("Bad timestamp", status=403)
+
+    if abs(time.time() - ts_int) > server_settings.signed_url_ttl_seconds:
+        return Response("Expired request", status=403)
+
+    expected = sign_raw_request(script_id, ts)
+    if not hmac.compare_digest(expected, sig):
+        return Response("Invalid signature", status=403)
+
+    if not roblox_only(request):
+        return Response("Access denied", status=403)
+
+    return Response(record.raw_script, mimetype="text/plain")
 
 
 if __name__ == "__main__":
